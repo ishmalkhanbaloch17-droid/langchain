@@ -7,6 +7,79 @@ import { ChainNode, TraceStep, SearchGroundingChunk, ParserType, SchemaField } f
 
 dotenv.config();
 
+// Global fetch interceptor to log downstream API call requests and responses.
+// This executes transparently for SDK fetch calls, highlighting missing or non-conforming JSON content-types.
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+  const url = typeof input === "string" 
+    ? input 
+    : (input instanceof URL ? input.toString() : input.url);
+  
+  console.log(`[Downstream Fetch Request] URL: ${url}`);
+  console.log(`[Downstream Fetch Request] Method: ${init?.method || "GET"}`);
+  
+  // Safely extract request headers, masking sensitive API credentials or tokens
+  const reqHeaders: Record<string, string> = {};
+  if (init?.headers) {
+    if (init.headers instanceof Headers) {
+      init.headers.forEach((val, key) => {
+        const lowerKey = key.toLowerCase();
+        reqHeaders[key] = lowerKey === "authorization" || lowerKey.includes("key") || lowerKey.includes("api-") ? "[REDACTED]" : val;
+      });
+    } else if (Array.isArray(init.headers)) {
+      init.headers.forEach(([key, val]) => {
+        const lowerKey = key.toLowerCase();
+        reqHeaders[key] = lowerKey === "authorization" || lowerKey.includes("key") || lowerKey.includes("api-") ? "[REDACTED]" : val;
+      });
+    } else {
+      for (const [key, val] of Object.entries(init.headers)) {
+        const lowerKey = key.toLowerCase();
+        reqHeaders[key] = lowerKey === "authorization" || lowerKey.includes("key") || lowerKey.includes("api-") ? "[REDACTED]" : val as string;
+      }
+    }
+  }
+  console.log(`[Downstream Fetch Request] Headers:`, JSON.stringify(reqHeaders));
+
+  try {
+    const response = await originalFetch(input, init);
+    console.log(`[Downstream Fetch Response] Status: ${response.status} ${response.statusText}`);
+    
+    // Log response headers
+    const resHeaders: Record<string, string> = {};
+    response.headers.forEach((val, key) => {
+      resHeaders[key] = val;
+    });
+    console.log(`[Downstream Fetch Response] Headers:`, JSON.stringify(resHeaders));
+
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType) {
+      console.warn(`[Downstream Fetch Warning] "content-type" header is completely MISSING for downstream response from: ${url}`);
+    } else if (!contentType.toLowerCase().includes("application/json")) {
+      console.warn(`[Downstream Fetch Warning] Invalid non-JSON content-type detected: "${contentType}" for downstream response from: ${url}`);
+    } else {
+      console.log(`[Downstream Fetch Info] Valid JSON response content-type: "${contentType}"`);
+    }
+
+    // Read response body securely, cloning so downstream parsing works unmodified
+    const clonedResponse = response.clone();
+    try {
+      const rawText = await clonedResponse.text();
+      console.log(`[Downstream Fetch Response] Raw Response Payload (up to 2000 chars):`);
+      console.log(rawText.substring(0, 2000));
+      if (rawText.length > 2000) {
+        console.log(`... [Response Payload Truncated, total size: ${rawText.length} bytes]`);
+      }
+    } catch (bodyErr: any) {
+      console.error(`[Downstream Fetch Response Error] Failed to read response body text stream:`, bodyErr.message);
+    }
+
+    return response;
+  } catch (err: any) {
+    console.error(`[Downstream Fetch Failure] Downstream API request failed completely for URL: ${url}`, err.message);
+    throw err;
+  }
+};
+
 const app = express();
 const PORT = 3000;
 
