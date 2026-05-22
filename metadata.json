@@ -1,0 +1,6 @@
+{
+  "name": "LangChain Flow Builder & Debugger",
+  "description": "An interactive, visual builder and execution debugger for LangChain Expression Language (LCEL) chains with live tracing and multi-language code generation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
