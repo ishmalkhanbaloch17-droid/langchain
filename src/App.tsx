@@ -301,6 +301,16 @@ export default function App() {
 
       const contentType = response.headers.get("content-type") || "";
       if (!contentType.includes("application/json")) {
+        const hostname = window.location.hostname;
+        const isStaticHosting = hostname.includes("vercel.app") || 
+                                hostname.includes("netlify.app") || 
+                                hostname.includes("github.io") ||
+                                hostname.includes("stackblitz") ||
+                                hostname.includes("webcontainer");
+        
+        if (isStaticHosting) {
+          throw new Error(`Static hosting environment detected (${hostname}). The backend Node/Express server ("server.ts") is not running here because this host only serves static frontend assets. To run your chain configurations: \n1. Run the app locally with "npm run dev"\n2. Deploy it to a Node.js-capable server host (like Render, Railway, or Heroku)\n3. Or continue using the application in AI Studio's live preview mode!`);
+        }
         throw new Error("The backend server is currently finishing its restart sequence or did not return a valid configuration dataset. Please wait 10 seconds and click 'Run Chain' again.");
       }
 
