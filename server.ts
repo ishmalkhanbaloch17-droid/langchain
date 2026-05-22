@@ -59,45 +59,68 @@ function buildGeminiSchema(fields: SchemaField[]) {
 
 // REST endpoint to run the chain visually and return full traces
 app.post("/api/chains/run", async (req, res) => {
+  res.setHeader("Content-Type", "application/json");
+
+  // Log incoming execution context
+  console.log(`[Chain Run] Incoming execution request at ${new Date().toISOString()}`);
+  
+  if (!req.body || typeof req.body !== "object") {
+    console.error("[Chain Run] Invalid request body syntax or missing body entirely.");
+    return res.status(400).json({
+      success: false,
+      error: "Malformed request payload received. Request body must be a valid JSON object."
+    });
+  }
+
   const { nodes, inputs, customApiKey } = req.body as { 
     nodes: ChainNode[]; 
     inputs: Record<string, string>; 
     customApiKey?: string; 
   };
 
-  if (!nodes || nodes.length === 0) {
+  if (!nodes || !Array.isArray(nodes) || nodes.length === 0) {
+    console.warn("[Chain Run] Validation failed: Zero nodes provided in chain configuration.");
     return res.status(400).json({
       success: false,
-      error: "No nodes provided in the chain."
+      error: "Validation failed: No nodes provided in the chain configuration."
     });
   }
 
-  // 1. Initialize trace steps
+  console.log(`[Chain Run] Parsed Composition Structure. Nodes Count: ${nodes.length}, Node Types: ${nodes.map(n => n.type).join(" -> ")}`);
+  console.log(`[Chain Run] Input values:`, JSON.stringify(inputs || {}));
+
+  // Create traces & setup tracking
   const trace: TraceStep[] = [];
   let currentInput = { ...inputs };
   let finalResult: any = null;
   let groundingChunks: SearchGroundingChunk[] = [];
 
-  const apiKey = customApiKey || process.env.GEMINI_API_KEY;
+  const apiKey = customApiKey?.trim() || process.env.GEMINI_API_KEY?.trim();
 
   if (!apiKey) {
+    console.warn("[Chain Run] Authentication failure: No API key found globally or custom override.");
     return res.status(400).json({
       success: false,
-      error: "No Gemini API Key found. Please add it via the 'API Credentials Override' field in the right-hand panel, or configure it globally in Settings > Secrets."
+      error: "Authentication failed: No active Gemini API Key found. Provide an override API key in the 'API Credentials' field in the right panel, or declare GEMINI_API_KEY in the environment."
     });
   }
+
+  // Masked key display for safe logs
+  const maskedKey = apiKey.length > 8 ? `${apiKey.substring(0, 4)}...${apiKey.substring(apiKey.length - 4)}` : "PROVIDED";
+  console.log(`[Chain Run] Using Gemini API Key: [${maskedKey}]`);
 
   const ai = new GoogleGenAI({
     apiKey,
     httpOptions: {
       headers: {
-        'User-Agent': 'aistudio-build',
+        'User-Agent': 'aistudio-build-lcel',
       }
     }
   });
 
   try {
     // --- STEP 1: RESOLVE INPUTS ---
+    console.log("[Chain Run] Step 1: Matching input parameter properties...");
     const inputNode = nodes.find(n => n.type === "Input");
     const inputStepId = inputNode?.id || "input-step";
     
@@ -106,16 +129,17 @@ app.post("/api/chains/run", async (req, res) => {
       name: "Resolve Input Variables",
       className: "chain.InputVariables",
       status: "success",
-      inputs: inputs,
+      inputs: inputs || {},
       outputs: currentInput,
-      durationMs: 12,
+      durationMs: 8,
       description: "LangChain processes raw prompt variables from the user environment."
     });
 
     // --- STEP 2: PROMPT CONSTRUCT ---
+    console.log("[Chain Run] Step 2: Compiling instructions template...");
     const promptNode = nodes.find(n => n.type === "PromptTemplate");
     if (!promptNode) {
-      throw new Error("Missing a PromptTemplate node in the chain flow.");
+      throw new Error("Missing structural PromptTemplate node in composition config diagram.");
     }
 
     const startPromptTime = Date.now();
@@ -150,9 +174,10 @@ app.post("/api/chains/run", async (req, res) => {
     });
 
     // --- STEP 3: LLM CALL COUPLING WITH OUTPUT PARSER INSTRUCTIONS ---
+    console.log("[Chain Run] Step 3: Preparing LLM engine connection parameter specs...");
     const modelNode = nodes.find(n => n.type === "ChatModel");
     if (!modelNode) {
-      throw new Error("Missing LLM ChatModel node in the chain flow.");
+      throw new Error("Missing active LLM ChatModel node in the chain workflow.");
     }
 
     const parserNode = nodes.find(n => n.type === "OutputParser");
@@ -171,6 +196,7 @@ app.post("/api/chains/run", async (req, res) => {
     };
 
     if (enableSearch) {
+      console.log("[Chain Run] Web Grounding enabled for this task run. Triggering live Google Search connection.");
       config.tools = [{ googleSearch: {} }];
     }
 
@@ -181,29 +207,48 @@ app.post("/api/chains/run", async (req, res) => {
     } else if (parserType === "json" && parserNode?.data.jsonSchema) {
       config.responseMimeType = "application/json";
       config.responseSchema = buildGeminiSchema(parserNode.data.jsonSchema);
+      console.log("[Chain Run] Structured JSON output schema enforced onto Gemini API configuration parameters.");
     }
 
     const promptToSend = userCompiled + parserInstructions;
 
-    // Call Gemini
-    const response = await ai.models.generateContent({
-      model: modelName,
-      contents: promptToSend,
-      config
-    });
+    console.log(`[Chain Run] Executing model generation call with '${modelName}'...`);
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: modelName,
+        contents: promptToSend,
+        config
+      });
+    } catch (apiErr: any) {
+      console.error("[Chain Run] Model API Generation crashed:", apiErr);
+      
+      let clientMsg = apiErr.message || "Unknown API response exception raised by Google GenAI client.";
+      if (clientMsg.includes("API_KEY") || clientMsg.includes("key is invalid") || apiErr.status === 403 || apiErr.status === 401) {
+        clientMsg = "The configured Gemini API key is invalid or lacks functional permissions. Please double check that you provided the correct credential.";
+      } else if (clientMsg.includes("quota") || apiErr.status === 429) {
+        clientMsg = "The Gemini model rate limit or request quota has been exceeded. Please retry in a few seconds.";
+      } else if (apiErr.status === 404) {
+        clientMsg = `The selected LLM model '${modelName}' could not be resolved or is unavailable in the current workspace.`;
+      }
+
+      throw new Error(`[Gemini Engine Call Failed]: ${clientMsg}`);
+    }
 
     const durationLLM = Date.now() - startLLMTime;
     const rawText = response.text || "";
+    console.log(`[Chain Run] Model call returned in ${durationLLM}ms. Response Text Sample: "${rawText.substring(0, 120).replace(/\n/g, " ")}..."`);
 
     // Extract search grounding if present
     const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
     if (chunks && Array.isArray(chunks)) {
       groundingChunks = chunks
         .map(c => ({
-          title: c.web?.title || c.maps?.uri || "Google Source",
+          title: c.web?.title || c.maps?.uri || "Google Source Link",
           uri: c.web?.uri || c.maps?.uri || "#"
         }))
         .filter(c => !!c.uri);
+      console.log(`[Chain Run] Captured ${groundingChunks.length} active grounding citations from Google Search engine.`);
     }
 
     trace.push({
@@ -227,6 +272,7 @@ app.post("/api/chains/run", async (req, res) => {
     });
 
     // --- STEP 4: OUTPUT PARSING ---
+    console.log(`[Chain Run] Step 4: Normalizing raw text structure towards type '${parserType}'...`);
     const startParseTime = Date.now();
     let parsedValue: any = rawText;
 
@@ -234,16 +280,18 @@ app.post("/api/chains/run", async (req, res) => {
       try {
         parsedValue = JSON.parse(rawText.trim());
       } catch (err: any) {
-        // Fallback or retry clean
+        console.warn("[Chain Run] Simple JSON parsing failed on outputText, attempting backup greedy regex block match.");
         const jsonMatch = rawText.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           try {
             parsedValue = JSON.parse(jsonMatch[0]);
           } catch (e) {
-            parsedValue = { error: "Failed to parse structural JSON", raw: rawText };
+            console.error("[Chain Run] Greedy matching also produced non-conforming block structure parsing syntax error.");
+            parsedValue = { error: "Failed to parse structural JSON model response", raw: rawText };
           }
         } else {
-          parsedValue = { error: "Output did not conform to JSON", raw: rawText };
+          console.error("[Chain Run] Could not locate any bracketed JSON structure tokens inside output.");
+          parsedValue = { error: "Output did not conform to JSON parser constraints", raw: rawText };
         }
       }
     } else if (parserType === "list") {
@@ -276,20 +324,34 @@ app.post("/api/chains/run", async (req, res) => {
       });
     }
 
-    return res.json({
+    // Build finalized serialization safe result model
+    const responsePayload = {
       success: true,
       trace,
       finalOutput: finalResult,
       groundingChunks
-    });
+    };
+
+    console.log("[Chain Run] Success: Entire compositions flow completed. Exporting tracing datasets...");
+    return res.json(responsePayload);
 
   } catch (err: any) {
-    console.error("Execution failure inside LangChain compiler:", err);
+    console.error("[Chain Run] Critical exception during execution pipeline:", err);
     return res.status(500).json({
       success: false,
-      error: err.message || "An exception occurred during chain compilation."
+      error: err.message || "An unexpected internal server exception occurred during structural composition pipeline execution."
     });
   }
+});
+
+// Global Express error handler middleware to intercept unhandled exceptions and return JSON answers
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error("[Unhandled Express Instance Error]:", err);
+  res.setHeader("Content-Type", "application/json");
+  return res.status(err.status || 500).json({
+    success: false,
+    error: err.message || "A fatal unhandled error occurred on the pipeline server."
+  });
 });
 
 async function startServer() {

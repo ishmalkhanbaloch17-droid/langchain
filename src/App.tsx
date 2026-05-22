@@ -299,7 +299,17 @@ export default function App() {
         })
       });
 
-      const data = await response.json();
+      const contentType = response.headers.get("content-type") || "";
+      if (!contentType.includes("application/json")) {
+        throw new Error("The backend server is currently finishing its restart sequence or did not return a valid configuration dataset. Please wait 10 seconds and click 'Run Chain' again.");
+      }
+
+      let data;
+      try {
+        data = await response.json();
+      } catch (jsonErr) {
+        throw new Error("The compilation server response was malformed. Please try again in a few seconds.");
+      }
 
       if (!response.ok || !data.success) {
         throw new Error(data.error || 'The execution server returned an error during compilation.');
