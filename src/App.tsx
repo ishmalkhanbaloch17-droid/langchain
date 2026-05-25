@@ -202,6 +202,43 @@ export default function App() {
     return localStorage.getItem("custom_gemini_api_key") || (import.meta as any).env?.VITE_GEMINI_API_KEY || "";
   });
 
+  // Backend Node server proxy configuration and online status
+  const [serverConfig, setServerConfig] = useState<{ checked: boolean; hasServerApiKey: boolean; isOnline: boolean }>({
+    checked: false,
+    hasServerApiKey: false,
+    isOnline: false
+  });
+
+  useEffect(() => {
+    let active = true;
+    const fetchConfig = async () => {
+      try {
+        const res = await fetch("/api/config");
+        if (!res.ok) throw new Error("HTTP error");
+        const data = await res.json();
+        if (active && data?.success) {
+          setServerConfig({
+            checked: true,
+            hasServerApiKey: !!data.hasServerApiKey,
+            isOnline: true
+          });
+        }
+      } catch (e) {
+        if (active) {
+          setServerConfig({
+            checked: true,
+            hasServerApiKey: false,
+            isOnline: false
+          });
+        }
+      }
+    };
+    fetchConfig();
+    return () => {
+      active = false;
+    };
+  }, []);
+
   useEffect(() => {
     localStorage.setItem("custom_gemini_api_key", customApiKey);
   }, [customApiKey]);
@@ -543,16 +580,19 @@ export default function App() {
       inputsMap[v.name] = v.value;
     });
 
-    const isStaticHosting = window.location.hostname.includes("vercel.app") || 
+    const isStaticHosting = (window.location.hostname.includes("vercel.app") || 
                             window.location.hostname.includes("netlify.app") || 
-                            window.location.hostname.includes("github.io") ||
-                            window.location.hostname.includes("stackblitz") ||
-                            window.location.hostname.includes("webcontainer");
+                            window.location.hostname.includes("github.io") || 
+                            window.location.hostname.includes("stackblitz") || 
+                            window.location.hostname.includes("webcontainer") ||
+                            (window.location.hostname.includes("localhost") === false && window.location.port === "")) &&
+                            !window.location.hostname.includes("run.app");
 
     const hasCustomApiKey = !!customApiKey.trim();
 
-    // If we're on a static host and have an API key override, run client-side to bypass backend unavailability!
-    if (isStaticHosting && hasCustomApiKey) {
+    // If we're on a static host or server is offline, and have an API key override, run client-side to bypass backend unavailability!
+    const shouldRunClientSide = (isStaticHosting || !serverConfig.isOnline) && hasCustomApiKey;
+    if (shouldRunClientSide) {
       try {
         console.log("[Client Execution] Running chain compilation and execution client-side.");
         const result = await executeChainClientSide(nodes, inputsMap, customApiKey.trim());
@@ -602,9 +642,9 @@ export default function App() {
         }
 
         if (isStaticHosting) {
-          throw new Error(`Vercel Static Hosting environment detected. To run chain configurations: \n1. Please paste your Gemini API Key in the "Gemini API Key Override" field inside the right side panel. This will activate secure, direct-from-browser client-side execution!\n2. Or, run the repository locally using "npm run dev".`);
+          throw new Error(`Static Hosting environment detected. To run chain configurations: \n1. Please paste your Gemini API Key in the "Gemini API Key Override" field inside the right side panel. This will activate secure, direct-from-browser client-side execution!\n2. Or, run the repository locally using "npm run dev".`);
         }
-        throw new Error("The backend execution server is currently starting or unreachable. To bypass this, please paste your Gemini API Key in the 'Gemini API Key Override' field in the right sidebar to run directly from the browser.");
+        throw new Error("The backend execution server did not return a valid response (perhaps it is starting up or experiencing a network gateway reset). To bypass this, you can paste your Gemini API Key in the 'Gemini API Key Override' field in the right sidebar to run directly and securely from your browser.");
       }
 
       let data;
@@ -1677,53 +1717,76 @@ print(outcome)
             
             <div className="space-y-2 text-xs">
               {(() => {
-                const isStatic = window.location.hostname.includes("vercel.app") || 
-                                 window.location.hostname.includes("netlify.app") || 
-                                 window.location.hostname.includes("github.io") ||
-                                 window.location.hostname.includes("stackblitz") ||
-                                 window.location.hostname.includes("webcontainer") ||
-                                 window.location.hostname.includes("localhost") === false && window.location.port === "";
                 const hasKey = !!customApiKey.trim();
 
-                if (isStatic) {
-                  if (hasKey) {
+                if (serverConfig.isOnline) {
+                  if (serverConfig.hasServerApiKey) {
                     return (
-                      <div className="p-2 rounded bg-indigo-500/10 border border-indigo-500/20 text-indigo-800 flex items-start gap-2 text-[10.5px]">
-                        <Check className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
+                      <div className="p-2 rounded bg-emerald-500/10 border border-emerald-500/20 text-emerald-800 flex items-start gap-2 text-[10.5px]">
+                        <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                         <div>
-                          <span className="font-bold">Direct Client Active</span>
-                          <p className="text-[9.5px] text-indigo-700/80 leading-normal mt-0.5">
-                            Static host detected. Secure browser-direct calls are active using your override key.
+                          <span className="font-bold">{hasKey ? "Override Key Active" : "Backend Proxy Active"}</span>
+                          <p className="text-[9.5px] text-emerald-700/80 leading-normal mt-0.5">
+                            {hasKey ? "Standard executions are running using your custom provider override key." : "Safe backend executions are fully authorized using standard server sandbox proxies."}
                           </p>
                         </div>
                       </div>
                     );
                   } else {
-                    return (
-                      <div className="p-2 rounded bg-amber-500/10 border border-amber-500/20 text-amber-800 flex items-start gap-2 text-[10.5px]">
-                        <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                        <div>
-                          <span className="font-bold">Static Host (No Key)</span>
-                          <p className="text-[9.5px] text-amber-700/80 leading-normal mt-0.5">
-                            Static hosting environment detected. Paste a Gemini API Key below to activate local client compiling.
-                          </p>
+                    if (hasKey) {
+                      return (
+                        <div className="p-2 rounded bg-indigo-500/10 border border-indigo-500/20 text-indigo-800 flex items-start gap-2 text-[10.5px]">
+                          <Check className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
+                          <div>
+                            <span className="font-bold">Override Key Active</span>
+                            <p className="text-[9.5px] text-indigo-700/80 leading-normal mt-0.5">
+                              Server lacks environment key. Running executions with your client override key.
+                            </p>
+                          </div>
                         </div>
-                      </div>
-                    );
+                      );
+                    } else {
+                      return (
+                        <div className="p-2 rounded bg-amber-500/10 border border-amber-500/20 text-amber-800 flex items-start gap-2 text-[10.5px]">
+                          <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                          <div>
+                            <span className="font-bold">API Key Required</span>
+                            <p className="text-[9.5px] text-amber-700/80 leading-normal mt-0.5">
+                              Sandbox server is online but has no default API key. Provide your key below to activate chain compilation.
+                            </p>
+                          </div>
+                        </div>
+                      );
+                    }
                   }
                 }
 
-                return (
-                  <div className="p-2 rounded bg-emerald-500/10 border border-emerald-500/20 text-emerald-800 flex items-start gap-2 text-[10.5px]">
-                    <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                    <div>
-                      <span className="font-bold">{hasKey ? "Override Key Active" : "Backend Proxy Active"}</span>
-                      <p className="text-[9.5px] text-emerald-700/80 leading-normal mt-0.5">
-                        {hasKey ? "All chain executions are compiling using your provider override key." : "Standard server-side execution proxies are operational in your sandbox."}
-                      </p>
+                // If server is not online (truly static or offline)
+                if (hasKey) {
+                  return (
+                    <div className="p-2 rounded bg-indigo-500/10 border border-indigo-500/20 text-indigo-800 flex items-start gap-2 text-[10.5px]">
+                      <Check className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
+                      <div>
+                        <span className="font-bold">Direct Client Active</span>
+                        <p className="text-[9.5px] text-indigo-700/80 leading-normal mt-0.5">
+                          Offline/Static host mode. Direct browser-to-Gemini execution is active using your override key.
+                        </p>
+                      </div>
                     </div>
-                  </div>
-                );
+                  );
+                } else {
+                  return (
+                    <div className="p-2 rounded bg-amber-500/10 border border-amber-500/20 text-amber-800 flex items-start gap-2 text-[10.5px]">
+                      <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                      <div>
+                        <span className="font-bold">Static or Offline Mode</span>
+                        <p className="text-[9.5px] text-amber-700/80 leading-normal mt-0.5">
+                          Compile server unreachable. Provide a Gemini API Key override below to run client-side.
+                        </p>
+                      </div>
+                    </div>
+                  );
+                }
               })()}
 
               <div className="space-y-1 pt-1">

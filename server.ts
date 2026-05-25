@@ -130,6 +130,15 @@ function buildGeminiSchema(fields: SchemaField[]) {
   };
 }
 
+// Config endpoint for client-side environment checking
+app.get("/api/config", (req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  return res.json({
+    success: true,
+    hasServerApiKey: typeof process.env.GEMINI_API_KEY === "string" && process.env.GEMINI_API_KEY.trim().length > 0
+  });
+});
+
 // REST endpoint to run the chain visually and return full traces
 app.post("/api/chains/run", async (req, res) => {
   res.setHeader("Content-Type", "application/json");
