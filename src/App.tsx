@@ -199,7 +199,7 @@ export default function App() {
 
   // Custom API key override stored locally inside the browser 
   const [customApiKey, setCustomApiKey] = useState<string>(() => {
-    return localStorage.getItem("custom_gemini_api_key") || "";
+    return localStorage.getItem("custom_gemini_api_key") || (import.meta as any).env?.VITE_GEMINI_API_KEY || "";
   });
 
   useEffect(() => {
@@ -1676,15 +1676,55 @@ print(outcome)
             </h3>
             
             <div className="space-y-2 text-xs">
-              <div className="p-2 rounded bg-emerald-500/10 border border-emerald-500/20 text-emerald-800 flex items-start gap-2 text-[10.5px]">
-                <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                <div>
-                  <span className="font-bold">Workspace Key Active</span>
-                  <p className="text-[9.5px] text-emerald-700/80 leading-normal mt-0.5">
-                    Your AI Studio environment key is handled securely behind standard server proxies.
-                  </p>
-                </div>
-              </div>
+              {(() => {
+                const isStatic = window.location.hostname.includes("vercel.app") || 
+                                 window.location.hostname.includes("netlify.app") || 
+                                 window.location.hostname.includes("github.io") ||
+                                 window.location.hostname.includes("stackblitz") ||
+                                 window.location.hostname.includes("webcontainer") ||
+                                 window.location.hostname.includes("localhost") === false && window.location.port === "";
+                const hasKey = !!customApiKey.trim();
+
+                if (isStatic) {
+                  if (hasKey) {
+                    return (
+                      <div className="p-2 rounded bg-indigo-500/10 border border-indigo-500/20 text-indigo-800 flex items-start gap-2 text-[10.5px]">
+                        <Check className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
+                        <div>
+                          <span className="font-bold">Direct Client Active</span>
+                          <p className="text-[9.5px] text-indigo-700/80 leading-normal mt-0.5">
+                            Static host detected. Secure browser-direct calls are active using your override key.
+                          </p>
+                        </div>
+                      </div>
+                    );
+                  } else {
+                    return (
+                      <div className="p-2 rounded bg-amber-500/10 border border-amber-500/20 text-amber-800 flex items-start gap-2 text-[10.5px]">
+                        <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                        <div>
+                          <span className="font-bold">Static Host (No Key)</span>
+                          <p className="text-[9.5px] text-amber-700/80 leading-normal mt-0.5">
+                            Static hosting environment detected. Paste a Gemini API Key below to activate local client compiling.
+                          </p>
+                        </div>
+                      </div>
+                    );
+                  }
+                }
+
+                return (
+                  <div className="p-2 rounded bg-emerald-500/10 border border-emerald-500/20 text-emerald-800 flex items-start gap-2 text-[10.5px]">
+                    <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold">{hasKey ? "Override Key Active" : "Backend Proxy Active"}</span>
+                      <p className="text-[9.5px] text-emerald-700/80 leading-normal mt-0.5">
+                        {hasKey ? "All chain executions are compiling using your provider override key." : "Standard server-side execution proxies are operational in your sandbox."}
+                      </p>
+                    </div>
+                  </div>
+                );
+              })()}
 
               <div className="space-y-1 pt-1">
                 <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block">
