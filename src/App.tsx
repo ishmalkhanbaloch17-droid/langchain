@@ -272,6 +272,263 @@ export default function App() {
     updateNodeData(inputNode.id, { variables: updatedVars });
   };
 
+  // Run client-side visual execution fallback if backend is offline/static
+  const executeChainClientSide = async (
+    nodes: ChainNode[], 
+    inputsMap: Record<string, string>, 
+    apiKey: string
+  ): Promise<{ trace: TraceStep[]; finalOutput: any; groundingChunks: SearchGroundingChunk[] | null }> => {
+    const trace: TraceStep[] = [];
+    let currentInput = { ...inputsMap };
+    let finalResult: any = null;
+    let fallbackGrounding: SearchGroundingChunk[] | null = null;
+
+    // --- STEP 1: RESOLVE INPUTS ---
+    const inputNode = nodes.find(n => n.type === "Input");
+    const inputStepId = inputNode?.id || "input-step";
+    trace.push({
+      id: inputStepId,
+      name: "Resolve Input Variables",
+      className: "chain.InputVariables",
+      status: "success",
+      inputs: inputsMap || {},
+      outputs: currentInput,
+      durationMs: 8,
+      description: "LangChain processes raw prompt variables from the user environment."
+    });
+
+    // --- STEP 2: PROMPT CONSTRUCT ---
+    const promptNode = nodes.find(n => n.type === "PromptTemplate");
+    if (!promptNode) {
+      throw new Error("Missing structural PromptTemplate node in composition config diagram.");
+    }
+
+    const startPromptTime = Date.now();
+    const systemTemplate = promptNode.data.systemPromptTemplate || "You are a professional assistant.";
+    const userTemplate = promptNode.data.userPromptTemplate || "Handle task: {input}";
+
+    const compileTemplateClient = (template: string, vars: Record<string, string>): string => {
+      let result = template;
+      for (const [key, value] of Object.entries(vars)) {
+        const escapedKey = key.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&");
+        const regex = new RegExp(`{${escapedKey}}`, "g");
+        result = result.replace(regex, value || "");
+      }
+      return result;
+    };
+
+    const systemCompiled = compileTemplateClient(systemTemplate, currentInput);
+    const userCompiled = compileTemplateClient(userTemplate, currentInput);
+
+    const promptOutputs = {
+      systemInstruction: systemCompiled,
+      userPrompt: userCompiled,
+      messages: [
+        { role: "system", content: systemCompiled },
+        { role: "user", content: userCompiled }
+      ]
+    };
+
+    trace.push({
+      id: promptNode.id,
+      name: "Construct ChatPromptTemplate",
+      className: "prompts.ChatPromptTemplate",
+      status: "success",
+      inputs: {
+        systemTemplate,
+        userTemplate,
+        variables: currentInput
+      },
+      outputs: promptOutputs,
+      durationMs: Date.now() - startPromptTime,
+      description: "Compiles templates by substituting bracket variables with input payloads."
+    });
+
+    // --- STEP 3: LLM CALL COUPLING ---
+    const modelNode = nodes.find(n => n.type === "ChatModel");
+    if (!modelNode) {
+      throw new Error("Missing active LLM ChatModel node in the chain workflow.");
+    }
+
+    const parserNode = nodes.find(n => n.type === "OutputParser");
+    const parserType: ParserType = parserNode?.data.parserType || "string";
+
+    const modelName = modelNode.data.modelName || "gemini-3.5-flash";
+    const temperature = modelNode.data.temperature !== undefined ? modelNode.data.temperature : 0.7;
+    const enableSearch = !!modelNode.data.enableSearch;
+
+    const startLLMTime = Date.now();
+
+    const buildGeminiSchemaClient = (fields: SchemaField[]) => {
+      const properties: Record<string, any> = {};
+      const required: string[] = [];
+
+      fields.forEach(f => {
+        let typeMap = "STRING";
+        let items: any = undefined;
+
+        if (f.type === "number") {
+          typeMap = "NUMBER";
+        } else if (f.type === "boolean") {
+          typeMap = "BOOLEAN";
+        } else if (f.type === "array") {
+          typeMap = "ARRAY";
+          items = { type: "STRING" };
+        }
+
+        properties[f.key] = {
+          type: typeMap,
+          description: f.description,
+          ...(items ? { items } : {})
+        };
+        required.push(f.key);
+      });
+
+      return {
+        type: "OBJECT",
+        properties,
+        required,
+      };
+    };
+
+    let parserInstructions = "";
+    let responseMimeType = "text/plain";
+    let responseSchema: any = undefined;
+
+    if (parserType === "list") {
+      parserInstructions = "\n\nCRITICAL: Formulate your response strictly as a comma-separated list of values (CSS format) with zero formatting or explanation. Example: item1, item2, item3";
+    } else if (parserType === "json" && parserNode?.data.jsonSchema) {
+      responseMimeType = "application/json";
+      responseSchema = buildGeminiSchemaClient(parserNode.data.jsonSchema);
+    }
+
+    const finalPrompt = userCompiled + parserInstructions;
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+
+    const requestBody = {
+      contents: [
+        {
+          parts: [{ text: finalPrompt }]
+        }
+      ],
+      systemInstruction: {
+        parts: [{ text: systemCompiled }]
+      },
+      generationConfig: {
+        temperature: temperature,
+        responseMimeType: responseMimeType,
+        ...(responseSchema ? { responseSchema } : {})
+      },
+      ...(enableSearch ? {
+        tools: [{ googleSearch: {} }]
+      } : {})
+    };
+
+    let response;
+    try {
+      response = await fetch(geminiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(requestBody)
+      });
+    } catch (netErr: any) {
+      throw new Error(`Direct connection to Gemini API failed. Ensure you are online and your API key allows browser CORS queries: ${netErr.message}`);
+    }
+
+    if (!response.ok) {
+      let errText = "";
+      try {
+        const errJson = await response.json();
+        errText = errJson.error?.message || response.statusText;
+      } catch (e) {
+        errText = response.statusText;
+      }
+      throw new Error(`Gemini LLM API error ${response.status}: ${errText}`);
+    }
+
+    const responseData = await response.json();
+    const durationLLM = Date.now() - startLLMTime;
+
+    const candidate = responseData.candidates?.[0];
+    const rawText = candidate?.content?.parts?.[0]?.text || "";
+
+    const chunks = candidate?.groundingMetadata?.groundingChunks;
+    if (chunks && Array.isArray(chunks)) {
+      fallbackGrounding = chunks
+        .map((c: any) => ({
+          title: c.web?.title || c.maps?.uri || "Google Source Link",
+          uri: c.web?.uri || c.maps?.uri || "#"
+        }))
+        .filter((c: any) => !!c.uri);
+    }
+
+    trace.push({
+      id: modelNode.id,
+      name: "Connect ChatGemini",
+      className: `models.${modelName}`,
+      status: "success",
+      inputs: {
+        modelName,
+        temperature,
+        prompt: finalPrompt,
+        enableSearch
+      },
+      outputs: {
+        text: rawText,
+        groundingMetadata: candidate?.groundingMetadata || null
+      },
+      durationMs: durationLLM,
+      description: "Direct secure LLM invocation using user API credentials override."
+    });
+
+    // --- STEP 4: OUTPUT PARSING ---
+    const startParseTime = Date.now();
+    let parsedValue: any = rawText;
+
+    if (parserType === "json") {
+      try {
+        parsedValue = JSON.parse(rawText.trim());
+      } catch (err) {
+        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          try {
+            parsedValue = JSON.parse(jsonMatch[0]);
+          } catch (e) {
+            parsedValue = { error: "Failed to parse structural JSON model response", raw: rawText };
+          }
+        } else {
+          parsedValue = { error: "Output did not conform to JSON parser constraints", raw: rawText };
+        }
+      }
+    } else if (parserType === "list") {
+      const cleaned = rawText.replace(/^\[|\]$/g, '').trim();
+      parsedValue = cleaned.split(",").map((s: string) => s.trim()).filter((s: string) => s.length > 0);
+    }
+
+    finalResult = parsedValue;
+
+    if (parserNode) {
+      trace.push({
+        id: parserNode.id,
+        name: `${parserType.toUpperCase()} Output Parser`,
+        className: parserType === "json" ? "parsers.JsonOutputParser" : (parserType === "list" ? "parsers.CommaSeparatedListOutputParser" : "parsers.StringOutputParser"),
+        status: "success",
+        inputs: rawText,
+        outputs: parsedValue,
+        durationMs: Date.now() - startParseTime,
+        description: "Standardizes, extracts, and parses multi-structured data feeds into strongly-typed variables."
+      });
+    }
+
+    return {
+      trace,
+      finalOutput: finalResult,
+      groundingChunks: fallbackGrounding
+    };
+  };
+
   // Run the visual chain visually through the server sandbox
   const handleExecuteChain = async () => {
     setIsExecuting(true);
@@ -285,6 +542,35 @@ export default function App() {
     variablesList.forEach(v => {
       inputsMap[v.name] = v.value;
     });
+
+    const isStaticHosting = window.location.hostname.includes("vercel.app") || 
+                            window.location.hostname.includes("netlify.app") || 
+                            window.location.hostname.includes("github.io") ||
+                            window.location.hostname.includes("stackblitz") ||
+                            window.location.hostname.includes("webcontainer");
+
+    const hasCustomApiKey = !!customApiKey.trim();
+
+    // If we're on a static host and have an API key override, run client-side to bypass backend unavailability!
+    if (isStaticHosting && hasCustomApiKey) {
+      try {
+        console.log("[Client Execution] Running chain compilation and execution client-side.");
+        const result = await executeChainClientSide(nodes, inputsMap, customApiKey.trim());
+        setExecutionTrace(result.trace);
+        setFinalOutput(result.finalOutput);
+        setGroundingChunks(result.groundingChunks);
+        if (result.trace && result.trace.length > 0) {
+          setExpandedTraceStep(result.trace[result.trace.length - 1].id);
+        }
+        return;
+      } catch (clientErr: any) {
+        console.error(clientErr);
+        setRunError(`[Client Execution Error]: ${clientErr.message}`);
+        return;
+      } finally {
+        setIsExecuting(false);
+      }
+    }
 
     try {
       const response = await fetch('/api/chains/run', {
@@ -301,17 +587,24 @@ export default function App() {
 
       const contentType = response.headers.get("content-type") || "";
       if (!contentType.includes("application/json")) {
-        const hostname = window.location.hostname;
-        const isStaticHosting = hostname.includes("vercel.app") || 
-                                hostname.includes("netlify.app") || 
-                                hostname.includes("github.io") ||
-                                hostname.includes("stackblitz") ||
-                                hostname.includes("webcontainer");
-        
-        if (isStaticHosting) {
-          throw new Error(`Static hosting environment detected (${hostname}). The backend Node/Express server ("server.ts") is not running here because this host only serves static frontend assets. To run your chain configurations: \n1. Run the app locally with "npm run dev"\n2. Deploy it to a Node.js-capable server host (like Render, Railway, or Heroku)\n3. Or continue using the application in AI Studio's live preview mode!`);
+        // Fallback option: If the server fetch returned non-JSON (like Vercel static router, or server timeout) 
+        // AND the user has entered their custom API Key override, we can run completely client-side automatically!
+        if (hasCustomApiKey) {
+          console.warn("[Server Offline/Non-JSON] Falling back to client-side chain compilations execution.");
+          const result = await executeChainClientSide(nodes, inputsMap, customApiKey.trim());
+          setExecutionTrace(result.trace);
+          setFinalOutput(result.finalOutput);
+          setGroundingChunks(result.groundingChunks);
+          if (result.trace && result.trace.length > 0) {
+            setExpandedTraceStep(result.trace[result.trace.length - 1].id);
+          }
+          return;
         }
-        throw new Error("The backend server is currently finishing its restart sequence or did not return a valid configuration dataset. Please wait 10 seconds and click 'Run Chain' again.");
+
+        if (isStaticHosting) {
+          throw new Error(`Vercel Static Hosting environment detected. To run chain configurations: \n1. Please paste your Gemini API Key in the "Gemini API Key Override" field inside the right side panel. This will activate secure, direct-from-browser client-side execution!\n2. Or, run the repository locally using "npm run dev".`);
+        }
+        throw new Error("The backend execution server is currently starting or unreachable. To bypass this, please paste your Gemini API Key in the 'Gemini API Key Override' field in the right sidebar to run directly from the browser.");
       }
 
       let data;
@@ -329,11 +622,29 @@ export default function App() {
       setFinalOutput(data.finalOutput);
       setGroundingChunks(data.groundingChunks || null);
       if (data.trace && data.trace.length > 0) {
-        // Auto expand the final parsing node to reveal output structural trees
         setExpandedTraceStep(data.trace[data.trace.length - 1].id);
       }
     } catch (err: any) {
       console.error(err);
+      
+      // Secondary fallback on connection failures (e.g. TypeError failed to fetch)
+      if (hasCustomApiKey) {
+        try {
+          console.warn("[Fetch Failed Fallback] Catch block engaged. Attempting secure client-side runner...");
+          const result = await executeChainClientSide(nodes, inputsMap, customApiKey.trim());
+          setExecutionTrace(result.trace);
+          setFinalOutput(result.finalOutput);
+          setGroundingChunks(result.groundingChunks);
+          if (result.trace && result.trace.length > 0) {
+            setExpandedTraceStep(result.trace[result.trace.length - 1].id);
+          }
+          return;
+        } catch (fallbackErr: any) {
+          setRunError(`[Both Server and Client runs failed] Server Error: ${err.message}. Client Fallback Error: ${fallbackErr.message}`);
+          return;
+        }
+      }
+
       setRunError(err.message || "Failed to communicate with LangChain Expression compiler.");
     } finally {
       setIsExecuting(false);
@@ -342,11 +653,44 @@ export default function App() {
 
   // Copy code utility state toggler
   const handleCopyCode = (text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => {
-      setCopied(false);
-    }, 2000);
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text)
+          .then(() => {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+          })
+          .catch(() => {
+            // Revert to fallback if Promise is rejected
+            fallbackCopy(text);
+          });
+      } else {
+        fallbackCopy(text);
+      }
+    } catch (err) {
+      fallbackCopy(text);
+    }
+  };
+
+  const fallbackCopy = (text: string) => {
+    try {
+      const textArea = document.createElement("textarea");
+      textArea.value = text;
+      textArea.style.position = "fixed";
+      textArea.style.left = "-999999px";
+      textArea.style.top = "-999999px";
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      const successful = document.execCommand("copy");
+      document.body.removeChild(textArea);
+      if (successful) {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      }
+    } catch (err) {
+      console.warn("Fallback clipboard copy failed:", err);
+    }
   };
 
   // Download final trace execution outcome to file
